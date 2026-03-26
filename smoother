@@ -1,0 +1,190 @@
+"""
+smoother.py
+-----------
+Exponential Weighted Average (EWA) smoother for noisy temperature readings.
+
+How EWA works in plain English
+--------------------------------
+At every timestep, the estimate is a weighted blend of:
+  - The NEW sensor reading       (weighted by alpha)
+  - The PREVIOUS estimate        (weighted by 1 - alpha)
+
+    estimate[t] = alpha * reading[t] + (1 - alpha) * estimate[t-1]
+
+Alpha controls the trade-off:
+  - alpha close to 1.0 → trusts new readings heavily → reacts fast, still noisy
+  - alpha close to 0.0 → trusts history heavily      → very smooth, slow to react
+
+Why run multiple alphas?
+------------------------
+No single alpha is optimal in all conditions:
+  - Overnight when temperature is stable, a LOW alpha (smooth) works best
+  - Morning when the heater kicks in, a HIGH alpha (responsive) works best
+
+By running 5 alphas simultaneously we can later use machine learning to
+discover WHICH alpha is optimal at each point in the day — that is the
+novel research question this project addresses.
+
+Handling dropout
+----------------
+When a sensor reading is None (dropped packet), EWA simply carries forward
+the previous estimate unchanged. This is mathematically equivalent to
+setting alpha=0 for that timestep only.
+
+Public API
+----------
+EWASmoother       – single alpha smoother
+MultiAlphaSmoother – runs N alphas simultaneously, returns all estimates
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Single alpha smoother
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SmootherConfig:
+    """Configuration for one EWA smoother instance.
+
+    Attributes
+    ----------
+    alpha        : Smoothing factor (0 < alpha ≤ 1).
+                   Low = smooth and slow. High = responsive and noisy.
+    initial_temp : Starting estimate before any readings arrive (°C).
+    """
+    alpha:        float = 0.5
+    initial_temp: float = 20.0
+
+
+class EWASmoother:
+    """Single exponential weighted average smoother.
+
+    Parameters
+    ----------
+    config : SmootherConfig with alpha and initial temperature.
+
+    Usage
+    -----
+    >>> smoother = EWASmoother(SmootherConfig(alpha=0.3))
+    >>> estimate = smoother.update(reading=21.4)
+    >>> estimate = smoother.update(reading=None)  # dropout — carries forward
+    """
+
+    def __init__(self, config: SmootherConfig) -> None:
+        self.config   = config
+        self.estimate = config.initial_temp   # current smoothed estimate
+        self.alpha    = config.alpha
+
+    def update(self, reading: Optional[float]) -> float:
+        """Update the smoothed estimate with a new sensor reading.
+
+        Parameters
+        ----------
+        reading : Sensor reading in °C, or None if the packet was dropped.
+
+        Returns
+        -------
+        The updated smoothed estimate in °C.
+        """
+        if reading is None:
+            # Dropout: carry previous estimate forward unchanged
+            # Equivalent to alpha=0 for this timestep only
+            return self.estimate
+
+        # EWA blend: new reading vs previous estimate
+        self.estimate = (
+            self.alpha * reading
+            + (1.0 - self.alpha) * self.estimate
+        )
+        return self.estimate
+
+    def reset(self, initial_temp: Optional[float] = None) -> None:
+        """Reset the smoother to its initial state."""
+        self.estimate = initial_temp if initial_temp is not None else self.config.initial_temp
+
+
+# ---------------------------------------------------------------------------
+# Multi-alpha smoother
+# ---------------------------------------------------------------------------
+
+class MultiAlphaSmoother:
+    """Runs multiple EWA smoothers simultaneously — one per alpha value.
+
+    This produces a separate smoothed estimate for each alpha at every
+    timestep, allowing direct comparison and ML-based alpha selection.
+
+    Parameters
+    ----------
+    alphas       : List of alpha values to run in parallel.
+    initial_temp : Starting temperature estimate for all smoothers (°C).
+
+    Usage
+    -----
+    >>> mas = MultiAlphaSmoother(alphas=[0.1, 0.3, 0.5, 0.7, 0.9])
+    >>> estimates = mas.update(reading=21.4)
+    >>> # estimates = {0.1: 20.14, 0.3: 20.42, 0.5: 20.7, 0.7: 20.98, 0.9: 21.26}
+    """
+
+    # Default alpha values — chosen to span the full slow→fast spectrum
+    DEFAULT_ALPHAS = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+    def __init__(
+        self,
+        alphas:       list[float] = None,
+        initial_temp: float       = 20.0,
+    ) -> None:
+        self.alphas   = alphas or self.DEFAULT_ALPHAS
+        self._smoothers = {
+            alpha: EWASmoother(SmootherConfig(alpha=alpha, initial_temp=initial_temp))
+            for alpha in self.alphas
+        }
+
+    def update(self, reading: Optional[float]) -> dict[float, float]:
+        """Update all smoothers with one reading and return all estimates.
+
+        Parameters
+        ----------
+        reading : Sensor reading in °C, or None if dropped.
+
+        Returns
+        -------
+        Dict mapping alpha → smoothed estimate for every alpha.
+        """
+        return {
+            alpha: smoother.update(reading)
+            for alpha, smoother in self._smoothers.items()
+        }
+
+    def reset(self, initial_temp: Optional[float] = None) -> None:
+        """Reset all smoothers to their initial state."""
+        for smoother in self._smoothers.values():
+            smoother.reset(initial_temp)
+
+    def best_alpha(
+        self,
+        estimates: dict[float, float],
+        true_temp: float,
+    ) -> float:
+        """Return the alpha whose estimate was closest to the true temperature.
+
+        This is used to generate the ML target variable — at each timestep
+        we record which alpha would have been optimal in hindsight.
+
+        Parameters
+        ----------
+        estimates : Dict alpha → estimate from the current timestep.
+        true_temp : The true room temperature from the physics model.
+
+        Returns
+        -------
+        The alpha value that produced the minimum absolute error.
+        """
+        return min(
+            estimates.keys(),
+            key=lambda a: abs(estimates[a] - true_temp),
+        )
