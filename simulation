@@ -1,4 +1,3 @@
-
 """
 simulation.py
 -------------
@@ -7,7 +6,7 @@ Ties everything together:
   1. RoomSimulator  – physics model of one room's temperature over time.
   2. run_simulation – runs the full 24-hour loop, returns a DataFrame.
   3. save_excel     – exports results to .xlsx for MATLAB / ML work.
-  4. print_summary  – prints RMSE comparison to the terminal.
+  4. print_summary  – prints RMSE comparison for each alpha to the terminal.
 
 Room thermal model (1R-1C)
 --------------------------
@@ -16,39 +15,51 @@ heat to the outdoors through a resistance R (1/UA, K/W).
 
 Discrete-time update:
     T[t+1] = T[t] + (dt / C) * (
-                UA * (T_out[t] - T[t])     ← heat loss to outdoors
-              + Q_heater[t]                ← heater power (W)
-              + Q_occupants               ← body heat (W/person × persons)
+                UA * (T_out[t] - T[t])     <- heat loss to outdoors
+              + Q_heater[t]                <- heater power (W)
+              + Q_occupants               <- body heat (W/person x persons)
             )
 
-The heater uses a simple on/off rule: heat if below 20°C, off if above 22°C.
-This creates a realistic temperature oscillation the Kalman filter must track.
+The heater uses a simple on/off rule: heat if below 20 C, off if above 22 C.
 
 Output columns in Excel
 -----------------------
-    timestamp_min   : Minutes since midnight (0, 5, 10, … 1435)
+Sheet 1 "Data" (288 rows):
+    timestamp_min   : Minutes since midnight (0, 5, 10, ... 1435)
     hour            : Hour of day (float, e.g. 9.5 = 09:30)
-    true_temp       : Actual room temperature from the physics model (°C)
-    noisy_reading   : Raw sensor reading (°C), or NaN if dropped
-    kalman_estimate : Kalman filter's estimate of true temperature (°C)
-    kalman_sigma    : Filter uncertainty (1-sigma, °C)
-    outdoor_temp    : Outdoor temperature profile (°C)
-    heater_on       : 1 if heater was on this timestep, 0 if off
-    error_raw       : |noisy_reading − true_temp|, NaN where dropped
-    error_kalman    : |kalman_estimate − true_temp|
+    true_temp       : Actual room temperature from the physics model (C)
+    noisy_reading   : Raw sensor reading (C), or NaN if dropped
+    ewa_0.1         : EWA smoothed estimate, alpha=0.1 (slow/smooth)
+    ewa_0.3         : EWA smoothed estimate, alpha=0.3
+    ewa_0.5         : EWA smoothed estimate, alpha=0.5
+    ewa_0.7         : EWA smoothed estimate, alpha=0.7
+    ewa_0.9         : EWA smoothed estimate, alpha=0.9 (fast/responsive)
+    best_alpha      : Which alpha had lowest error this timestep (ML target)
+    outdoor_temp    : Outdoor temperature profile (C)
+    heater_on       : 1 if heater was on, 0 if off
+    occupants       : Number of people in the room
+    error_raw       : |noisy_reading - true_temp|, NaN where dropped
+    error_ewa_0.1   : |ewa_0.1 - true_temp|
+    error_ewa_0.3   : |ewa_0.3 - true_temp|
+    error_ewa_0.5   : |ewa_0.5 - true_temp|
+    error_ewa_0.7   : |ewa_0.7 - true_temp|
+    error_ewa_0.9   : |ewa_0.9 - true_temp|
+
+Sheet 2 "Summary": RMSE metrics for each alpha and the raw sensor.
+Sheet 3 "Alpha_Frequency": How often each alpha was best throughout the day.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from kalman import KalmanConfig, KalmanFilter
 from sensor import Sensor, SensorConfig
+from smoother import MultiAlphaSmoother
 
 
 # ---------------------------------------------------------------------------
@@ -61,15 +72,14 @@ class RoomConfig:
 
     Attributes
     ----------
-    capacitance_j_k  : Thermal mass C in J/K. A medium office room ≈ 1.5e6.
+    capacitance_j_k  : Thermal mass C in J/K. A medium office room ~ 1.5e6.
     ua_w_k           : Overall heat-loss coefficient UA in W/K.
-                       Higher = leakier building.
     heater_power_w   : Heater output in Watts when on.
     persons          : Number of occupants (each contributes ~80 W body heat).
     dt_seconds       : Timestep duration (300 s = 5 minutes).
-    init_temp        : Starting room temperature (°C).
-    outdoor_mean     : Mean outdoor temperature for daily cycle (°C).
-    outdoor_amplitude: Daily swing ±amplitude around the mean (°C).
+    init_temp        : Starting room temperature (C).
+    outdoor_mean     : Mean outdoor temperature for daily cycle (C).
+    outdoor_amplitude: Daily swing +/- amplitude around the mean (C).
     seed             : RNG seed for deterministic results.
     """
     capacitance_j_k:   float = 1.5e6
@@ -93,33 +103,23 @@ class RoomSimulator:
     Usage
     -----
     >>> sim = RoomSimulator(RoomConfig())
-    >>> T_next = sim.step(unix_minutes=0)
+    >>> output = sim.step(minute_of_day=0.0)
     """
 
-    HEAT_PER_PERSON_W = 80.0   # sensible heat gain per occupant
+    HEAT_PER_PERSON_W = 80.0
 
     def __init__(self, config: RoomConfig) -> None:
-        self.config = config
-        self.temp   = config.init_temp    # current room temperature
+        self.config    = config
+        self.temp      = config.init_temp
         self.heater_on = False
 
     def outdoor_temp(self, minute_of_day: float) -> float:
-        """Sinusoidal outdoor temperature: minimum at 04:00, max at 14:00.
-
-        Parameters
-        ----------
-        minute_of_day : Minutes since midnight (0–1439).
-        """
-        # sin(-π/2) = -1 so minimum lands at minute=240 (04:00)
-        # maximum lands at minute=960 (16:00)
+        """Sinusoidal outdoor temperature: minimum at 04:00, max at 16:00."""
         radians = 2 * math.pi * (minute_of_day - 240) / 1440 - math.pi / 2
         return self.config.outdoor_mean + self.config.outdoor_amplitude * math.sin(radians)
 
     def occupants(self, minute_of_day: float) -> int:
-        """Return number of people in the room based on time of day.
-
-        Simple office schedule: empty overnight, full 09:00–17:00.
-        """
+        """Return number of people in the room based on time of day."""
         hour = minute_of_day / 60
         if 9.0 <= hour < 17.0:
             return self.config.persons
@@ -145,7 +145,7 @@ class RoomSimulator:
         T_out = self.outdoor_temp(minute_of_day)
         occ   = self.occupants(minute_of_day)
 
-        # Simple bang-bang heater: on below 20°C, off above 22°C
+        # Bang-bang heater controller
         if self.temp < 20.0:
             self.heater_on = True
         elif self.temp > 22.0:
@@ -154,11 +154,11 @@ class RoomSimulator:
         Q_heater = self.config.heater_power_w if self.heater_on else 0.0
         Q_people = occ * self.HEAT_PER_PERSON_W
 
-        # Forward Euler integration of the heat balance equation
+        # Forward Euler heat balance
         dT = (dt / C) * (
-            UA * (T_out - self.temp)   # heat loss through walls
-            + Q_heater                 # heater input
-            + Q_people                 # body heat
+            UA * (T_out - self.temp)
+            + Q_heater
+            + Q_people
         )
         self.temp += dT
 
@@ -174,20 +174,23 @@ class RoomSimulator:
 # Main simulation runner
 # ---------------------------------------------------------------------------
 
+ALPHAS = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+
 def run_simulation(
     room_cfg:   Optional[RoomConfig]   = None,
     sensor_cfg: Optional[SensorConfig] = None,
-    kalman_cfg: Optional[KalmanConfig] = None,
+    alphas:     Optional[list[float]]  = None,
 ) -> pd.DataFrame:
     """Run a full 24-hour simulation and return results as a DataFrame.
 
-    Uses 5-minute timesteps → 288 rows total.
+    Uses 5-minute timesteps giving 288 rows total.
 
     Parameters
     ----------
     room_cfg   : Room physics config (uses defaults if None).
     sensor_cfg : Sensor noise config (uses defaults if None).
-    kalman_cfg : Kalman filter tuning (uses defaults if None).
+    alphas     : List of EWA alpha values (uses [0.1,0.3,0.5,0.7,0.9] if None).
 
     Returns
     -------
@@ -195,18 +198,14 @@ def run_simulation(
     """
     room_cfg   = room_cfg   or RoomConfig()
     sensor_cfg = sensor_cfg or SensorConfig()
-    # Match Kalman's measurement noise to the sensor's noise_std
-    kalman_cfg = kalman_cfg or KalmanConfig(
-        measurement_noise=sensor_cfg.noise_std ** 2,
-        initial_temp=room_cfg.init_temp,
-    )
+    alphas     = alphas     or ALPHAS
 
-    room   = RoomSimulator(room_cfg)
-    sensor = Sensor(sensor_cfg)
-    kf     = KalmanFilter(kalman_cfg)
+    room    = RoomSimulator(room_cfg)
+    sensor  = Sensor(sensor_cfg)
+    smoother = MultiAlphaSmoother(alphas=alphas, initial_temp=room_cfg.init_temp)
 
-    dt_min   = room_cfg.dt_seconds / 60.0   # timestep in minutes
-    n_steps  = int(1440 / dt_min)            # steps in 24 hours
+    dt_min  = room_cfg.dt_seconds / 60.0
+    n_steps = int(1440 / dt_min)
 
     records = []
 
@@ -214,141 +213,163 @@ def run_simulation(
         minute = step * dt_min
 
         # 1. Advance room physics
-        room_out = room.step(minute_of_day=minute)
+        room_out  = room.step(minute_of_day=minute)
         true_temp = room_out["true_temp"]
 
         # 2. Get noisy sensor reading (may be None if dropped)
         reading = sensor.read(true_temp)
 
-        # 3. Run Kalman filter
-        estimate = kf.step(
-            reading=reading,
-            outdoor_temp=room_out["outdoor_temp"],
-        )
+        # 3. Update all EWA smoothers simultaneously
+        estimates = smoother.update(reading=reading)
 
-        # 4. Compute errors
-        error_raw    = abs(reading - true_temp) if reading is not None else float("nan")
-        error_kalman = abs(estimate - true_temp)
+        # 4. Find which alpha was best this timestep (ML target variable)
+        best = smoother.best_alpha(estimates, true_temp)
 
-        records.append({
-            "timestamp_min":   minute,
-            "hour":            minute / 60.0,
-            "true_temp":       round(true_temp, 4),
-            "noisy_reading":   round(reading, 4) if reading is not None else float("nan"),
-            "kalman_estimate": round(estimate, 4),
-            "kalman_sigma":    round(kf.uncertainty, 4),
-            "outdoor_temp":    round(room_out["outdoor_temp"], 4),
-            "heater_on":       room_out["heater_on"],
-            "occupants":       room_out["occupants"],
-            "error_raw":       round(error_raw, 4),
-            "error_kalman":    round(error_kalman, 4),
-        })
+        # 5. Compute errors
+        error_raw = abs(reading - true_temp) if reading is not None else float("nan")
 
-    return pd.DataFrame(records)
+        # 6. Build record
+        record = {
+            "timestamp_min": minute,
+            "hour":          round(minute / 60.0, 4),
+            "true_temp":     round(true_temp, 4),
+            "noisy_reading": round(reading, 4) if reading is not None else float("nan"),
+            "outdoor_temp":  round(room_out["outdoor_temp"], 4),
+            "heater_on":     room_out["heater_on"],
+            "occupants":     room_out["occupants"],
+            "best_alpha":    best,
+            "error_raw":     round(error_raw, 4),
+        }
+
+        # Add one column per alpha for estimates and errors
+        for alpha in alphas:
+            est = estimates[alpha]
+            col = f"ewa_{alpha}"
+            record[col]              = round(est, 4)
+            record[f"error_{col}"]   = round(abs(est - true_temp), 4)
+
+        records.append(record)
+
+    # Build DataFrame with a clean column order
+    alpha_cols       = [f"ewa_{a}"       for a in alphas]
+    error_alpha_cols = [f"error_ewa_{a}" for a in alphas]
+
+    col_order = (
+        ["timestamp_min", "hour", "true_temp", "noisy_reading"]
+        + alpha_cols
+        + ["best_alpha", "outdoor_temp", "heater_on", "occupants", "error_raw"]
+        + error_alpha_cols
+    )
+
+    return pd.DataFrame(records)[col_order]
 
 
 # ---------------------------------------------------------------------------
 # Excel export
 # ---------------------------------------------------------------------------
 
-def save_excel(df: pd.DataFrame, path: str = "smart_room_results.xlsx") -> None:
-    """Save results DataFrame to a formatted Excel workbook.
+def save_excel(
+    df:    pd.DataFrame,
+    path:  str           = "smart_room_results.xlsx",
+    alphas: list[float]  = None,
+) -> None:
+    """Save results to a formatted Excel workbook with three sheets.
 
-    The Excel file is laid out so it can be imported directly into MATLAB:
-      - Sheet 1 "Data"    : all 288 rows of simulation data
-      - Sheet 2 "Summary" : RMSE metrics and config values
+    Sheet 1 "Data"           : all 288 rows of simulation data
+    Sheet 2 "Summary"        : RMSE metrics for each alpha vs raw sensor
+    Sheet 3 "Alpha_Frequency": how often each alpha was best (ML context)
 
     Parameters
     ----------
-    df   : DataFrame from run_simulation().
-    path : Output file path.
+    df     : DataFrame from run_simulation().
+    path   : Output file path.
+    alphas : Alpha values used (auto-detected from columns if None).
     """
+    alphas = alphas or ALPHAS
+
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
 
         # ── Sheet 1: raw data ──────────────────────────────────────────
         df.to_excel(writer, sheet_name="Data", index=False)
-
         ws = writer.sheets["Data"]
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width = 14
 
-        # Set column widths for readability
-        col_widths = {
-            "A": 15, "B": 8,  "C": 12, "D": 14,
-            "E": 16, "F": 14, "G": 14, "H": 10,
-            "I": 10, "J": 12, "K": 14,
-        }
-        for col, w in col_widths.items():
-            ws.column_dimensions[col].width = w
+        # ── Sheet 2: RMSE summary ──────────────────────────────────────
+        raw_errors = df["error_raw"].dropna()
+        sensor_rmse = float(raw_errors.pow(2).mean() ** 0.5)
+        n_dropped   = df["noisy_reading"].isna().sum()
 
-        # ── Sheet 2: summary metrics ───────────────────────────────────
-        raw_errors    = df["error_raw"].dropna()
-        kalman_errors = df["error_kalman"]
-        n_dropped     = df["noisy_reading"].isna().sum()
+        rows = [
+            {"Method": "Raw sensor",   "RMSE (°C)": round(sensor_rmse, 4),
+             "Improvement vs raw (%)": "—"},
+        ]
+        for alpha in alphas:
+            col   = f"error_ewa_{alpha}"
+            rmse  = float(df[col].pow(2).mean() ** 0.5)
+            impro = round(100 * (1 - rmse / sensor_rmse), 1)
+            rows.append({
+                "Method":                  f"EWA alpha={alpha}",
+                "RMSE (°C)":               round(rmse, 4),
+                "Improvement vs raw (%)":  impro,
+            })
 
-        summary_data = {
-            "Metric": [
-                "Timesteps (total)",
-                "Dropped readings",
-                "Drop rate (%)",
-                "Sensor RMSE (°C)",
-                "Kalman RMSE (°C)",
-                "RMSE improvement (%)",
-                "Mean true temp (°C)",
-                "Min true temp (°C)",
-                "Max true temp (°C)",
-                "Mean Kalman sigma (°C)",
-            ],
-            "Value": [
-                len(df),
-                int(n_dropped),
-                round(100 * n_dropped / len(df), 1),
-                round(float(raw_errors.pow(2).mean() ** 0.5), 4),
-                round(float(kalman_errors.pow(2).mean() ** 0.5), 4),
-                round(100 * (1 - (kalman_errors.pow(2).mean() ** 0.5)
-                             / (raw_errors.pow(2).mean() ** 0.5)), 1),
-                round(float(df["true_temp"].mean()), 2),
-                round(float(df["true_temp"].min()), 2),
-                round(float(df["true_temp"].max()), 2),
-                round(float(df["kalman_sigma"].mean()), 4),
-            ],
-        }
-        summary_df = pd.DataFrame(summary_data)
+        summary_df = pd.DataFrame(rows)
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
-
         ws2 = writer.sheets["Summary"]
-        ws2.column_dimensions["A"].width = 28
-        ws2.column_dimensions["B"].width = 16
+        ws2.column_dimensions["A"].width = 20
+        ws2.column_dimensions["B"].width = 14
+        ws2.column_dimensions["C"].width = 24
 
-    print(f"Excel saved: {path}  ({len(df)} rows)")
+        # ── Sheet 3: alpha frequency (ML context) ─────────────────────
+        freq = df["best_alpha"].value_counts().reset_index()
+        freq.columns = ["alpha", "timesteps_best"]
+        freq["percentage"] = (freq["timesteps_best"] / len(df) * 100).round(1)
+        freq = freq.sort_values("alpha").reset_index(drop=True)
+        freq.to_excel(writer, sheet_name="Alpha_Frequency", index=False)
+        ws3 = writer.sheets["Alpha_Frequency"]
+        ws3.column_dimensions["A"].width = 10
+        ws3.column_dimensions["B"].width = 18
+        ws3.column_dimensions["C"].width = 14
+
+    print(f"Excel saved: {path}  ({len(df)} rows, {len(alphas)} alpha values)")
 
 
 # ---------------------------------------------------------------------------
 # Terminal summary
 # ---------------------------------------------------------------------------
 
-def print_summary(df: pd.DataFrame) -> None:
-    """Print a clean RMSE comparison to the terminal."""
-    raw_errors    = df["error_raw"].dropna()
-    kalman_errors = df["error_kalman"]
-    n_dropped     = df["noisy_reading"].isna().sum()
-
+def print_summary(df: pd.DataFrame, alphas: list[float] = None) -> None:
+    """Print RMSE for each alpha and the best alpha frequency distribution."""
+    alphas      = alphas or ALPHAS
+    raw_errors  = df["error_raw"].dropna()
     sensor_rmse = float(raw_errors.pow(2).mean() ** 0.5)
-    kalman_rmse = float(kalman_errors.pow(2).mean() ** 0.5)
-    improvement = 100 * (1 - kalman_rmse / sensor_rmse)
+    n_dropped   = df["noisy_reading"].isna().sum()
 
     print()
-    print("=" * 48)
+    print("=" * 52)
     print("  Smart Room Simulation — 24h Results")
-    print("=" * 48)
+    print("=" * 52)
     print(f"  Timesteps:          {len(df)}")
     print(f"  Dropped readings:   {n_dropped} ({100*n_dropped/len(df):.1f}%)")
-    print()
-    print(f"  Sensor RMSE:        {sensor_rmse:.4f} °C")
-    print(f"  Kalman RMSE:        {kalman_rmse:.4f} °C")
-    print(f"  Improvement:        {improvement:.1f}%")
-    print()
-    print(f"  Mean true temp:     {df['true_temp'].mean():.2f} °C")
     print(f"  Temp range:         {df['true_temp'].min():.2f} – {df['true_temp'].max():.2f} °C")
-    print("=" * 48)
+    print()
+    print(f"  {'Method':<20} {'RMSE (°C)':<12} {'Improvement'}")
+    print(f"  {'-'*20} {'-'*12} {'-'*12}")
+    print(f"  {'Raw sensor':<20} {sensor_rmse:<12.4f} —")
+
+    for alpha in alphas:
+        rmse  = float(df[f"error_ewa_{alpha}"].pow(2).mean() ** 0.5)
+        impro = 100 * (1 - rmse / sensor_rmse)
+        print(f"  {f'EWA alpha={alpha}':<20} {rmse:<12.4f} {impro:+.1f}%")
+
+    print()
+    print("  Best alpha distribution (ML target variable):")
+    counts = df["best_alpha"].value_counts().sort_index()
+    for alpha, count in counts.items():
+        bar = "█" * int(count / len(df) * 40)
+        print(f"    α={alpha}  {bar}  {count} steps ({100*count/len(df):.1f}%)")
+    print("=" * 52)
     print()
 
 
@@ -364,3 +385,4 @@ if __name__ == "__main__":
     save_excel(df, "smart_room_results.xlsx")
 
     print("Done. Open smart_room_results.xlsx to see all 288 timesteps.")
+    print("Tip: the 'best_alpha' column is your ML target variable in MATLAB.")
