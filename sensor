@@ -1,1 +1,100 @@
 
+"""
+sensor.py
+---------
+Simulates a real-world thermometer with two realistic imperfections:
+
+  1. Gaussian noise  – every reading is slightly wrong by a random amount.
+  2. Random dropout  – occasionally the sensor fails to return any value
+                       (models packet loss, dead battery, loose wire, etc).
+
+This mirrors what a real IoT temperature sensor behaves like in a building.
+
+Public API
+----------
+SensorConfig   – stores the sensor's noise and dropout settings
+Sensor         – produces one noisy reading, or None if dropped
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+
+
+@dataclass
+class SensorConfig:
+    """All tunable parameters for one sensor.
+
+    Attributes
+    ----------
+    noise_std    : Standard deviation of Gaussian noise in °C.
+                   A real cheap thermometer is typically 0.3–1.0 °C.
+    dropout_prob : Probability (0–1) that a reading is silently lost.
+                   0.0 = perfectly reliable, 1.0 = always fails.
+    bias         : Constant offset added to every reading (systematic error).
+                   Models a poorly calibrated sensor, default 0.0.
+    seed         : Random seed so results are reproducible.
+    """
+    noise_std:    float = 0.5
+    dropout_prob: float = 0.05
+    bias:         float = 0.0
+    seed:         int   = 42
+
+
+class Sensor:
+    """A simulated temperature sensor.
+
+    Parameters
+    ----------
+    config : SensorConfig with noise and dropout settings.
+
+    Usage
+    -----
+    >>> cfg = SensorConfig(noise_std=0.5, dropout_prob=0.05)
+    >>> sensor = Sensor(cfg)
+    >>> reading = sensor.read(true_temp=21.0)
+    >>> # reading is either a float near 21.0, or None if dropped
+    """
+
+    def __init__(self, config: SensorConfig) -> None:
+        self.config   = config
+        # Two separate RNGs so noise and dropout don't interfere with each other
+        self._noise_rng   = np.random.default_rng(config.seed)
+        self._dropout_rng = random.Random(config.seed)
+
+    def read(self, true_temp: float) -> Optional[float]:
+        """Return a noisy temperature reading, or None if the packet is dropped.
+
+        Parameters
+        ----------
+        true_temp : The actual room temperature in °C (from the simulator).
+
+        Returns
+        -------
+        A float (noisy reading) or None (dropped packet).
+        """
+        # Step 1: randomly decide if this reading is dropped
+        if self._dropout_rng.random() < self.config.dropout_prob:
+            return None  # sensor failed this timestep
+
+        # Step 2: add Gaussian noise and bias to the true temperature
+        noise   = float(self._noise_rng.normal(0.0, self.config.noise_std))
+        reading = true_temp + self.config.bias + noise
+        return reading
+
+    def stream(self, true_temps: list[float]) -> list[Optional[float]]:
+        """Read a whole sequence of true temperatures at once.
+
+        Parameters
+        ----------
+        true_temps : List of ground-truth temperatures, one per timestep.
+
+        Returns
+        -------
+        List of floats (or None where dropped), same length as input.
+        """
+        return [self.read(t) for t in true_temps]
