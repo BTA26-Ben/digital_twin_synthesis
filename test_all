@@ -1,1 +1,292 @@
 
+"""
+tests/test_all.py
+-----------------
+Complete test suite for the smart room project.
+
+Run with:   python -m pytest tests/ -v
+            (from inside the smart_room/ folder)
+
+Tests are organised into four categories, clearly labelled:
+  NOMINAL     – normal everyday operation, expected to pass cleanly
+  EDGE CASE   – boundary conditions (zero noise, 100% dropout, etc)
+  EXCEPTIONAL – error/failure handling (bad inputs, extreme values)
+  PERFORMANCE – timing requirements
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import os
+import time
+
+import pytest
+import numpy as np
+
+# Allow imports from parent folder
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from sensor import Sensor, SensorConfig
+from kalman import KalmanFilter, KalmanConfig
+from simulation import RoomSimulator, RoomConfig, run_simulation
+
+
+# ============================================================
+# SENSOR TESTS
+# ============================================================
+
+class TestSensorNominal:
+    """Normal operation — sensor produces noisy readings."""
+
+    def test_reading_close_to_true_value(self):
+        """Mean of many readings should be within 0.3°C of true value."""
+        cfg    = SensorConfig(noise_std=0.5, dropout_prob=0.0, seed=1)
+        sensor = Sensor(cfg)
+        readings = [sensor.read(21.0) for _ in range(500)]
+        assert abs(float(np.mean(readings)) - 21.0) < 0.3
+
+    def test_noise_std_matches_config(self):
+        """Empirical std of readings should be within 30% of noise_std."""
+        cfg    = SensorConfig(noise_std=1.0, dropout_prob=0.0, seed=2)
+        sensor = Sensor(cfg)
+        readings = [sensor.read(20.0) for _ in range(1000)]
+        assert 0.7 < float(np.std(readings)) < 1.3
+
+    def test_bias_shifts_mean(self):
+        """Mean reading should equal true_temp + bias."""
+        cfg    = SensorConfig(noise_std=0.01, dropout_prob=0.0, bias=2.0, seed=3)
+        sensor = Sensor(cfg)
+        readings = [sensor.read(20.0) for _ in range(300)]
+        assert abs(float(np.mean(readings)) - 22.0) < 0.1
+
+    def test_stream_returns_correct_length(self):
+        """stream() should return same number of values as input."""
+        cfg    = SensorConfig(dropout_prob=0.0, seed=4)
+        sensor = Sensor(cfg)
+        result = sensor.stream([20.0, 21.0, 22.0, 23.0, 24.0])
+        assert len(result) == 5
+
+    def test_dropout_rate_approximately_correct(self):
+        """Empirical dropout rate should be within 5pp of configured rate."""
+        cfg    = SensorConfig(noise_std=0.1, dropout_prob=0.2, seed=5)
+        sensor = Sensor(cfg)
+        readings   = [sensor.read(20.0) for _ in range(2000)]
+        n_dropped  = sum(1 for r in readings if r is None)
+        empirical  = n_dropped / 2000
+        assert abs(empirical - 0.2) < 0.05
+
+
+class TestSensorEdgeCases:
+    """Boundary conditions."""
+
+    def test_zero_dropout_never_drops(self):
+        """With dropout_prob=0, every reading should be non-None."""
+        cfg    = SensorConfig(dropout_prob=0.0, seed=10)
+        sensor = Sensor(cfg)
+        for _ in range(100):
+            assert sensor.read(21.0) is not None
+
+    def test_full_dropout_always_none(self):
+        """With dropout_prob=1.0, every reading should be None."""
+        cfg    = SensorConfig(dropout_prob=1.0, seed=11)
+        sensor = Sensor(cfg)
+        for _ in range(50):
+            assert sensor.read(21.0) is None
+
+    def test_zero_noise_returns_exact_true_plus_bias(self):
+        """With noise_std=0 and bias=0, reading should equal true_temp."""
+        cfg    = SensorConfig(noise_std=0.0, dropout_prob=0.0, bias=0.0, seed=12)
+        sensor = Sensor(cfg)
+        assert abs(sensor.read(21.5) - 21.5) < 1e-9
+
+
+# ============================================================
+# KALMAN FILTER TESTS
+# ============================================================
+
+class TestKalmanNominal:
+    """Normal filter operation."""
+
+    def test_update_moves_estimate_toward_observation(self):
+        """After update with a high observation, estimate should increase."""
+        kf = KalmanFilter(KalmanConfig(initial_temp=20.0))
+        kf.predict()
+        before = kf.x
+        kf.update(reading=25.0)
+        assert kf.x > before
+
+    def test_uncertainty_decreases_after_update(self):
+        """P should shrink after incorporating an observation."""
+        kf = KalmanFilter(KalmanConfig(initial_temp=20.0))
+        kf.predict()
+        P_before = kf.P
+        kf.update(reading=20.5)
+        assert kf.P < P_before
+
+    def test_uncertainty_increases_during_predict_only(self):
+        """P should grow when predicting without any observation."""
+        kf = KalmanFilter(KalmanConfig(initial_temp=20.0, initial_uncertainty=0.1))
+        P_before = kf.P
+        for _ in range(10):
+            kf.predict()
+        assert kf.P > P_before
+
+    def test_filter_converges_toward_true_value(self):
+        """After 50 steps of noisy readings around 21°C, estimate ≈ 21°C."""
+        kf  = KalmanFilter(KalmanConfig(initial_temp=15.0, measurement_noise=0.25))
+        rng = np.random.default_rng(99)
+        for _ in range(50):
+            noisy = 21.0 + float(rng.normal(0, 0.5))
+            kf.step(reading=noisy)
+        assert abs(kf.x - 21.0) < 1.0
+
+    def test_sigma_property_is_sqrt_of_variance(self):
+        """uncertainty property should equal sqrt(P)."""
+        kf = KalmanFilter(KalmanConfig(initial_uncertainty=4.0))
+        assert abs(kf.uncertainty - 2.0) < 1e-9
+
+
+class TestKalmanEdgeCases:
+    """Boundary and dropout conditions."""
+
+    def test_none_reading_does_not_crash(self):
+        """update(None) should return the prediction without raising."""
+        kf = KalmanFilter(KalmanConfig())
+        kf.predict()
+        result = kf.update(reading=None)
+        assert isinstance(result, float)
+
+    def test_sustained_dropout_keeps_reasonable_estimate(self):
+        """100 consecutive None readings should not cause explosion."""
+        kf = KalmanFilter(KalmanConfig(initial_temp=21.0))
+        for _ in range(100):
+            kf.step(reading=None, outdoor_temp=10.0)
+        assert 5.0 < kf.x < 40.0
+
+    def test_step_convenience_matches_predict_then_update(self):
+        """step() result should match calling predict() then update() manually."""
+        cfg = KalmanConfig(initial_temp=20.0, seed=0) if hasattr(KalmanConfig, 'seed') else KalmanConfig(initial_temp=20.0)
+
+        kf1 = KalmanFilter(KalmanConfig(initial_temp=20.0))
+        kf2 = KalmanFilter(KalmanConfig(initial_temp=20.0))
+
+        r = 21.3
+        result_step = kf1.step(reading=r, outdoor_temp=10.0)
+        kf2.predict(outdoor_temp=10.0)
+        result_manual = kf2.update(reading=r)
+
+        assert abs(result_step - result_manual) < 1e-9
+
+
+class TestKalmanExceptional:
+    """Extreme input values."""
+
+    def test_very_cold_outdoor_stays_bounded(self):
+        """Extreme outdoor temperature should not destabilise the filter."""
+        kf = KalmanFilter(KalmanConfig(initial_temp=20.0))
+        for _ in range(20):
+            kf.step(reading=None, outdoor_temp=-40.0)
+        assert kf.x > -50.0   # physically bounded
+
+    def test_very_hot_outdoor_stays_bounded(self):
+        """Very high outdoor temperature should not overflow."""
+        kf = KalmanFilter(KalmanConfig(initial_temp=20.0))
+        for _ in range(20):
+            kf.step(reading=50.0, outdoor_temp=50.0)
+        assert kf.x < 100.0
+
+
+# ============================================================
+# INTEGRATION TESTS
+# ============================================================
+
+class TestSimulationIntegration:
+    """Full pipeline from room physics → sensor → Kalman → DataFrame."""
+
+    def test_run_produces_288_rows(self):
+        """24 hours at 5-min intervals = exactly 288 timesteps."""
+        df = run_simulation()
+        assert len(df) == 288
+
+    def test_all_required_columns_present(self):
+        """DataFrame must contain every expected output column."""
+        df       = run_simulation()
+        required = [
+            "timestamp_min", "hour", "true_temp", "noisy_reading",
+            "kalman_estimate", "kalman_sigma", "outdoor_temp",
+            "heater_on", "occupants", "error_raw", "error_kalman",
+        ]
+        for col in required:
+            assert col in df.columns, f"Missing column: {col}"
+
+    def test_kalman_rmse_lower_than_sensor_rmse(self):
+        """Kalman filter must outperform the raw sensor on RMSE."""
+        df           = run_simulation()
+        raw_errors   = df["error_raw"].dropna()
+        kalman_errors = df["error_kalman"]
+        sensor_rmse  = float(raw_errors.pow(2).mean() ** 0.5)
+        kalman_rmse  = float(kalman_errors.pow(2).mean() ** 0.5)
+        assert kalman_rmse < sensor_rmse
+
+    def test_temperatures_physically_bounded(self):
+        """All temperatures should stay within physical bounds 0–40°C."""
+        df = run_simulation()
+        assert df["true_temp"].between(0, 40).all()
+        assert df["kalman_estimate"].between(-5, 50).all()
+
+    def test_determinism_same_seed_same_results(self):
+        """Two runs with the same seed must produce identical DataFrames."""
+        df1 = run_simulation()
+        df2 = run_simulation()
+        assert list(df1["true_temp"]) == list(df2["true_temp"])
+        assert list(df1["kalman_estimate"]) == list(df2["kalman_estimate"])
+
+    def test_different_seeds_give_different_sensor_readings(self):
+        """Different sensor seeds must produce different noisy readings."""
+        from sensor import SensorConfig
+        df1 = run_simulation(sensor_cfg=SensorConfig(seed=42))
+        df2 = run_simulation(sensor_cfg=SensorConfig(seed=99))
+        assert list(df1["noisy_reading"]) != list(df2["noisy_reading"])
+
+
+class TestSimulationPerformance:
+    """Timing requirements."""
+
+    def test_full_24h_simulation_under_5_seconds(self):
+        """288-step simulation should complete well under 5 seconds."""
+        t0 = time.perf_counter()
+        run_simulation()
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 5.0, f"Simulation took {elapsed:.2f}s — too slow"
+
+
+class TestRoomSimulator:
+    """Room physics model unit tests."""
+
+    def test_heater_raises_temperature(self):
+        """With heater on and cold outdoor temp, room should warm up."""
+        cfg = RoomConfig(init_temp=15.0, outdoor_mean=5.0)
+        sim = RoomSimulator(cfg)
+        t0  = sim.temp
+        for i in range(20):
+            sim.step(minute_of_day=float(i * 5))
+        assert sim.temp > t0
+
+    def test_outdoor_temp_min_at_4am(self):
+        """Outdoor temperature minimum should occur around 04:00 (240 min)."""
+        sim   = RoomSimulator(RoomConfig())
+        temps = [sim.outdoor_temp(float(m)) for m in range(0, 1440, 5)]
+        min_idx = temps.index(min(temps))
+        # Minimum should be around step 48 (240 min / 5 = 48)
+        assert 40 <= min_idx <= 56
+
+    def test_no_occupants_overnight(self):
+        """Room should have zero occupants at midnight (minute 0)."""
+        sim = RoomSimulator(RoomConfig())
+        assert sim.occupants(0.0) == 0
+
+    def test_occupants_during_business_hours(self):
+        """Room should have occupants at 10:00 (minute 600)."""
+        sim = RoomSimulator(RoomConfig(persons=5))
+        assert sim.occupants(600.0) > 0
